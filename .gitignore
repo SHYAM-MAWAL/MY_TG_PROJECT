@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Environment variables (CRITICAL - never commit secrets!)
+.env
+.env.local
+.env.*.local
+
+# Telegram session files (contains authentication tokens)
+*.session
+*.session-journal
+
+# Runtime scraper state (local / Coolify volume)
+last_message_id.txt
+seen_source_urls.txt
+telegram_qr.png
+session_diag.session*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Local data files (if any)
+courses.json
+local_data/
+
+# Docker
+.docker/

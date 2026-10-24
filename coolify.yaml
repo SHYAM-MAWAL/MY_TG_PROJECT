@@ -1,0 +1,46 @@
+# Coolify: use Docker Compose build pack with docker-compose.yaml
+# Two services:
+#   telegram-scraper — polls Telegram → Postgres
+#   courses-api      — public GET /courses for the frontend
+services:
+  telegram-scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_PHONE=${TELEGRAM_PHONE}
+      - TELEGRAM_GROUP=${TELEGRAM_GROUP}
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - POSTGRES_PORT=${POSTGRES_PORT}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_SSLMODE=${POSTGRES_SSLMODE:-disable}
+      - COURSE_PURGE_DAYS=${COURSE_PURGE_DAYS:-3}
+      - SESSION_PATH=/app/sessions/session_name
+    volumes:
+      - sessions:/app/sessions
+    restart: unless-stopped
+
+  courses-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "courses_api.py"]
+    ports:
+      - "8080:8080"
+    environment:
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - POSTGRES_PORT=${POSTGRES_PORT}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_SSLMODE=${POSTGRES_SSLMODE:-disable}
+      - COURSE_PURGE_DAYS=${COURSE_PURGE_DAYS:-3}
+      - PORT=8080
+    restart: unless-stopped
+
+volumes:
+  sessions:

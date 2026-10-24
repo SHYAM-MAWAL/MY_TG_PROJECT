@@ -1,0 +1,23 @@
+# Telegram API Credentials
+# Get these from https://my.telegram.org/apps
+TELEGRAM_API_ID=your_api_id
+TELEGRAM_API_HASH=your_api_hash
+TELEGRAM_PHONE=+1234567890
+TELEGRAM_GROUP=your_group_username
+
+# Webhook (optional)
+WEBHOOK_URL=https://your-n8n-instance.com/webhook/your-webhook-id
+
+# Postgres — Coolify internal (apps on same server):
+# POSTGRES_HOST=ehl6emvbhq43ifzrvmxowu49
+# POSTGRES_PORT=5432
+# Local / Mac (external):
+POSTGRES_HOST=185.245.182.223
+POSTGRES_PORT=5433
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=your_password_here
+POSTGRES_DB=postgres
+POSTGRES_SSLMODE=disable
+
+# Auto-delete courses older than N days
+COURSE_PURGE_DAYS=3
