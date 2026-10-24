@@ -51,10 +51,25 @@ cp env_template.txt .env   # fill in Telegram + Postgres
 
 ### Authenticate Telegram (once)
 
+**Local:**
+
 ```bash
 python auth_telegram_qr.py
 # or: python auth_telegram.py
 ```
+
+**Coolify (recommended — QR login inside the scraper container):**
+
+```bash
+# Find the telegram-scraper container name in Coolify, then:
+docker exec -it <telegram-scraper-container> python auth_telegram_qr.py
+```
+
+1. Scan the ASCII QR from the terminal (Telegram → Settings → Devices → Link Desktop Device).
+2. After success, **restart** the scraper service so `main.py` picks up the new session.
+3. Session files live on the persistent volume at `SESSION_PATH` (default `/app/sessions/session_name`).
+
+While QR auth runs, `auth_telegram_qr.py` writes `/app/sessions/.auth_in_progress` so the scraper skips that cycle instead of touching the session. You can also use `TELEGRAM_CODE` / `TELEGRAM_PASSWORD` env vars for code-based login.
 
 ### Run scraper
 
@@ -107,7 +122,8 @@ See **[QUICK_START_COOLIFY.md](QUICK_START_COOLIFY.md)** for step-by-step:
 2. Set env vars (use **internal** Postgres host/port)
 3. Persist volume `/app/sessions`
 4. Expose `courses-api` on port `8080` with a domain
-5. Authenticate Telegram once
+5. Authenticate Telegram once via QR:
+   `docker exec -it <telegram-scraper-container> python auth_telegram_qr.py` — then restart
 6. Point frontend `NEXT_PUBLIC_COURSES_API_URL` at that API domain
 
 ## Postgres schema

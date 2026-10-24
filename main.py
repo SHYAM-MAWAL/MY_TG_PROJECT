@@ -12,11 +12,18 @@ if sys.platform == 'win32':
         pass  # Skip if not available (e.g., in Docker)
 
 from telethon import TelegramClient
+from telethon.errors import (
+    AuthKeyDuplicatedError,
+    AuthKeyUnregisteredError,
+    SessionRevokedError,
+)
 import re
 import requests
 from lxml import html
 import time
 import base64
+import glob
+import shutil
 from datetime import datetime
 from dotenv import load_dotenv
 from postgres_handler import PostgresHandler
@@ -125,6 +132,73 @@ if not session_path:
 # Create Telegram client
 client = TelegramClient(session_path, api_id, api_hash)
 
+# Lock file while auth_telegram_qr.py is running (same volume as the session)
+AUTH_LOCK_STALE_SECONDS = 10 * 60  # 10 minutes
+
+
+def auth_lock_path():
+    session_dir = os.path.dirname(session_path) or "."
+    return os.path.join(session_dir, ".auth_in_progress")
+
+
+def is_auth_lock_active():
+    """True if QR/auth is in progress. Stale locks (>10 min) are ignored."""
+    path = auth_lock_path()
+    if not os.path.exists(path):
+        return False
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return False
+    if age > AUTH_LOCK_STALE_SECONDS:
+        print(
+            f"⚠ Auth lock is stale ({int(age)}s old, limit {AUTH_LOCK_STALE_SECONDS}s) "
+            f"— ignoring {path}"
+        )
+        return False
+    return True
+
+
+def is_sqlite_locked_error(exc):
+    msg = str(exc).lower()
+    return "database is locked" in msg or (
+        "operationalerror" in msg and "locked" in msg
+    )
+
+
+def is_session_revoked_error(exc):
+    return isinstance(
+        exc,
+        (AuthKeyUnregisteredError, SessionRevokedError, AuthKeyDuplicatedError),
+    ) or any(
+        name in type(exc).__name__
+        for name in (
+            "AuthKeyUnregisteredError",
+            "SessionRevokedError",
+            "AuthKeyDuplicatedError",
+        )
+    )
+
+
+def backup_revoked_session_files(path):
+    """Rename session files to .bak-<timestamp> instead of deleting them."""
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    session_dir = os.path.dirname(path) or "."
+    session_base = os.path.basename(path)
+    pattern = os.path.join(session_dir, f"{session_base}.session*")
+    moved = []
+    for file_path in glob.glob(pattern):
+        # Keep existing backups
+        if ".bak-" in os.path.basename(file_path):
+            continue
+        dest = f"{file_path}.bak-{ts}"
+        try:
+            shutil.move(file_path, dest)
+            moved.append(dest)
+        except Exception as e:
+            print(f"⚠ Could not backup {file_path}: {e}")
+    return moved
+
 
 def check_if_processed(target_url):
     """Check if URL was already processed in this run (in-memory, fast)"""
@@ -219,321 +293,226 @@ def extract_url_from_xpath(page_url):
         return None
 
 
-def delete_session_files(session_path):
-    """Delete all session-related files (including corrupted ones)"""
-    import glob
-    files_deleted = []
-    
-    # Delete .session file
-    session_file = f"{session_path}.session"
-    if os.path.exists(session_file):
+async def _disconnect_quietly():
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+
+
+async def _env_code_login():
+    """Authenticate with TELEGRAM_CODE / TELEGRAM_PASSWORD (or CLI args). Never deletes sessions."""
+    code_used = False
+
+    def code_callback():
+        nonlocal code_used
+        if args.code:
+            if code_used:
+                print("⚠ Code already used. Requesting new code from Telegram...")
+                print("   Please check your Telegram app for a new code and update TELEGRAM_CODE")
+                raise Exception("Code already used, need new code")
+            code_used = True
+            print("✓ Using code from command line argument")
+            return args.code
+
+        code = os.getenv("TELEGRAM_CODE")
+        if code:
+            if code_used:
+                print("⚠ Code already used. Requesting new code from Telegram...")
+                print("   Please check your Telegram app for a new code and update TELEGRAM_CODE")
+                raise Exception("Code already used, need new code")
+            code_used = True
+            print("✓ Using code from environment variable")
+            return code
+
         try:
-            os.remove(session_file)
-            files_deleted.append(session_file)
-        except Exception as e:
-            print(f"⚠ Could not delete {session_file}: {e}")
-    
-    # Delete .session-journal file
-    session_journal = f"{session_path}.session-journal"
-    if os.path.exists(session_journal):
+            return input("Please enter the code you received: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n✗ Authentication cancelled. Cannot proceed without code.")
+            print("   Tip: Set TELEGRAM_CODE environment variable in Coolify")
+            raise
+
+    def password_callback():
+        if args.password:
+            print("✓ Using password from command line argument")
+            return args.password
+        password = os.getenv("TELEGRAM_PASSWORD")
+        if password:
+            print("✓ Using password from environment variable")
+            return password
         try:
-            os.remove(session_journal)
-            files_deleted.append(session_journal)
-        except Exception as e:
-            print(f"⚠ Could not delete {session_journal}: {e}")
-    
-    # Delete any other related files (e.g., .session-shm, .session-wal for SQLite)
-    session_dir = os.path.dirname(session_path) or '.'
-    session_base = os.path.basename(session_path)
-    pattern = os.path.join(session_dir, f"{session_base}.session*")
-    for file_path in glob.glob(pattern):
-        if file_path not in files_deleted:
-            try:
-                os.remove(file_path)
-                files_deleted.append(file_path)
-            except Exception as e:
-                print(f"⚠ Could not delete {file_path}: {e}")
-    
-    return files_deleted
+            return input("Please enter your 2FA password: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n✗ Authentication cancelled. Cannot proceed without password.")
+            print(
+                "   Tip: Use --password argument, set TELEGRAM_PASSWORD environment "
+                "variable, or run in interactive terminal"
+            )
+            sys.exit(1)
+
+    print("🔐 Starting authentication (TELEGRAM_CODE / password)...")
+    try:
+        await client.start(
+            phone=phone, code_callback=code_callback, password=password_callback
+        )
+        print("✓ Authentication successful!")
+        print("✓ Session saved. You can now run without authentication.")
+        print("💡 Tip: You can remove TELEGRAM_CODE from environment variables now.")
+        return None
+    except Exception as e:
+        error_msg = str(e)
+        print(f"\n✗ Authentication failed: {error_msg}")
+        await _disconnect_quietly()
+
+        if is_sqlite_locked_error(e):
+            print("⚠ Session database is locked (another process may be using it).")
+            print("⚠ Skipping this run — session files left untouched.")
+            return None
+
+        if "wait of" in error_msg.lower() and "seconds" in error_msg.lower():
+            wait_match = re.search(r"wait of (\d+) seconds", error_msg.lower())
+            if wait_match:
+                wait_seconds = int(wait_match.group(1))
+                wait_minutes = wait_seconds // 60
+                print("\n" + "=" * 80)
+                print("⚠ RATE LIMITED - Telegram requires waiting")
+                print("=" * 80)
+                print(
+                    f"Telegram requires waiting {wait_minutes} minutes "
+                    f"({wait_seconds} seconds) before retry."
+                )
+                print("\nThe script will retry in 3 minutes (faster than required wait).")
+                print("Please ensure TELEGRAM_CODE is updated with a fresh code.")
+                print("=" * 80)
+                return "RATE_LIMITED"
+            print("\n⚠ Rate limited by Telegram. Will retry in 3 minutes...")
+            return "RATE_LIMITED"
+
+        if (
+            "3 consecutive" in error_msg
+            or "rate limit" in error_msg.lower()
+            or "too many" in error_msg.lower()
+        ):
+            print("\n" + "=" * 80)
+            print("⚠ RATE LIMITED - Too many failed authentication attempts")
+            print("=" * 80)
+            print("Telegram has temporarily blocked authentication attempts.")
+            print("\nTo fix this:")
+            print("1. Wait 10-15 minutes for the rate limit to reset")
+            print("2. Request a NEW code from Telegram (old codes expire quickly)")
+            print("3. Update TELEGRAM_CODE in Coolify with the fresh code")
+            print("4. The script will retry in 3 minutes (faster retry for authentication)")
+            print("=" * 80)
+            return "RATE_LIMITED"
+
+        if (
+            "code" in error_msg.lower()
+            or "invalid" in error_msg.lower()
+            or "PHONE_CODE" in error_msg
+            or "Code already used" in error_msg
+        ):
+            print("\n⚠ Invalid or expired code.")
+            print("   Telegram codes expire quickly (usually within 3-5 minutes).")
+            print("   Please request a NEW code from Telegram and update TELEGRAM_CODE variable.")
+            print("   Will retry in 3 minutes (faster retry for authentication)...")
+            return "AUTH_FAILED"
+
+        print("   Please check your credentials and try again.")
+        print("   Will retry in 3 minutes (faster retry for authentication)...")
+        return "AUTH_FAILED"
 
 
 async def main():
     """Main function to scrape Telegram group for course URLs"""
     global client  # Declare global at the start of the function
-    
-    # Track authentication attempts for faster retry
-    auth_retry_count = 0
-    max_auth_retries = 0  # Will be set based on environment
-    
-    # Check if session already exists
+
+    if is_auth_lock_active():
+        print("\n" + "=" * 80)
+        print("⚠ AUTH IN PROGRESS — skipping this run")
+        print("=" * 80)
+        print(f"Lock file present: {auth_lock_path()}")
+        print("Another process (auth_telegram_qr.py) is logging in.")
+        print("Session files will NOT be touched.")
+        print("=" * 80 + "\n")
+        return None
+
     session_file = f"{session_path}.session"
-    
     if os.path.exists(session_file):
         print("✓ Found existing session file, attempting to connect...")
     else:
         print("⚠ No session file found. First-time authentication required.")
-        print("   Telegram will send a code to your phone. Please enter it when prompted.")
-    
-    # Try to connect first without authentication
-    session_corrupted = False
+
+    authorized = False
     try:
         await client.connect()
-        if not await client.is_user_authorized():
-            print("⚠ Session expired or invalid. Re-authentication required.")
-            try:
-                await client.disconnect()
-            except:
-                pass  # Ignore disconnect errors
-            
-            # Delete invalid session files to force fresh authentication
-            print("🗑️  Deleting invalid session file...")
-            deleted = delete_session_files(session_path)
-            if deleted:
-                print(f"✓ Deleted {len(deleted)} session file(s): {', '.join([os.path.basename(f) for f in deleted])}")
-            else:
-                print("⚠ No session files found to delete")
-            
-            raise Exception("Not authorized")
-        print("✓ Connected using existing session")
-    except Exception as e:
-        error_str = str(e)
-        
-        # Check if it's a corrupted session file error (SQLite errors)
-        if "no such table" in error_str or "OperationalError" in error_str or "corrupt" in error_str.lower() or "update_state" in error_str:
-            session_corrupted = True
-            print("⚠ Session file appears to be corrupted (SQLite database error).")
-            print("🗑️  Deleting corrupted session file...")
-            
-            # Try to disconnect, but ignore errors since session is corrupted
-            try:
-                await client.disconnect()
-            except:
-                pass  # Ignore disconnect errors - session is already corrupted
-            
-            # Delete all session files
-            deleted = delete_session_files(session_path)
-            if deleted:
-                print(f"✓ Deleted {len(deleted)} corrupted session file(s): {', '.join([os.path.basename(f) for f in deleted])}")
-            else:
-                print("⚠ No session files found to delete")
-            
-            # Recreate client with clean session
-            client = TelegramClient(session_path, api_id, api_hash)
-            print("✓ Created fresh client instance")
-            
-        elif "Not authorized" not in error_str:
-            # Re-raise if it's a different error
-            raise
-        
-        # Need to authenticate (only print if not already printed above)
-        if not session_corrupted:
-            print("🔐 Starting authentication...")
-        
-        # Check if we have a code available (from env or args)
-        has_code = args.code or os.getenv('TELEGRAM_CODE')
-        if not has_code:
-            print("\n" + "="*80)
-            print("⚠ AUTHENTICATION REQUIRED")
-            print("="*80)
-            print("Telegram authentication is required but no code is available.")
-            print("\nTo authenticate in Coolify:")
-            print("1. Go to your Telegram app and request a new verification code")
-            print("2. In Coolify, go to Environment Variables")
-            print("3. Add temporary variable: TELEGRAM_CODE=your_code_here")
-            print("4. Restart the container")
-            print("5. After successful authentication, remove TELEGRAM_CODE variable")
-            print("="*80 + "\n")
-            print("⚠ Skipping this run. Will retry in 5 minutes...")
-            return  # Exit gracefully instead of crashing
-        
-        # Track if we've already used the code to prevent reusing expired codes
-        code_used = False
-        
-        # Custom code callback that checks command line args, then environment variable, then prompts
-        def code_callback():
-            nonlocal code_used
-            
-            # Check command line argument first
-            if args.code:
-                if code_used:
-                    print("⚠ Code already used. Requesting new code from Telegram...")
-                    print("   Please check your Telegram app for a new code and update TELEGRAM_CODE")
-                    raise Exception("Code already used, need new code")
-                code_used = True
-                print(f"✓ Using code from command line argument")
-                return args.code
-            
-            # Check environment variable
-            code = os.getenv('TELEGRAM_CODE')
-            if code:
-                if code_used:
-                    print("⚠ Code already used. Requesting new code from Telegram...")
-                    print("   Please check your Telegram app for a new code and update TELEGRAM_CODE")
-                    raise Exception("Code already used, need new code")
-                code_used = True
-                print(f"✓ Using code from environment variable")
-                return code
-            
-            # Otherwise prompt for input (shouldn't reach here if has_code check worked)
-            try:
-                return input('Please enter the code you received: ')
-            except (EOFError, KeyboardInterrupt):
-                print("\n✗ Authentication cancelled. Cannot proceed without code.")
-                print("   Tip: Set TELEGRAM_CODE environment variable in Coolify")
-                raise
-        
-        # Custom password callback for 2FA
-        def password_callback():
-            # Check command line argument first
-            if args.password:
-                print(f"✓ Using password from command line argument")
-                return args.password
-            # Check environment variable
-            password = os.getenv('TELEGRAM_PASSWORD')
-            if password:
-                print(f"✓ Using password from environment variable")
-                return password
-            try:
-                return input('Please enter your 2FA password: ')
-            except (EOFError, KeyboardInterrupt):
-                print("\n✗ Authentication cancelled. Cannot proceed without password.")
-                print("   Tip: Use --password argument, set TELEGRAM_PASSWORD environment variable, or run in interactive terminal")
-                sys.exit(1)
-        
         try:
-            await client.start(phone=phone, code_callback=code_callback, password=password_callback)
-            print("✓ Authentication successful!")
-            print("✓ Session saved. You can now run without authentication.")
-            print("💡 Tip: You can remove TELEGRAM_CODE from environment variables now.")
-        except Exception as e:
-            error_msg = str(e)
-            print(f"\n✗ Authentication failed: {error_msg}")
-            
-            # Check if it's a corrupted session database error during authentication
-            if "no such table" in error_msg or "OperationalError" in error_msg or "update_state" in error_msg:
-                print("⚠ Session database corrupted during authentication.")
-                print("🗑️  Deleting all session files and recreating client...")
-                
-                # Try to disconnect, but ignore errors
-                try:
-                    await client.disconnect()
-                except:
-                    pass
-                
-                # Delete all session files
-                deleted = delete_session_files(session_path)
-                if deleted:
-                    print(f"✓ Deleted {len(deleted)} corrupted session file(s)")
-                
-                # Recreate client with clean session
-                client = TelegramClient(session_path, api_id, api_hash)
-                print("✓ Created fresh client instance")
-                
-                # Try authentication again with fresh client
-                try:
-                    print("🔄 Retrying authentication with fresh session...")
-                    # Reset code_used flag for retry
-                    code_used = False
-                    await client.start(phone=phone, code_callback=code_callback, password=password_callback)
-                    print("✓ Authentication successful after cleanup!")
-                    print("✓ Session saved. You can now run without authentication.")
-                    print("💡 Tip: You can remove TELEGRAM_CODE from environment variables now.")
-                except Exception as e2:
-                    error_msg2 = str(e2)
-                    print(f"\n✗ Authentication failed again: {error_msg2}")
-                    try:
-                        await client.disconnect()
-                    except:
-                        pass
-                    
-                    # Check for rate limiting (Telegram's "wait of X seconds" error)
-                    if "wait of" in error_msg2.lower() and "seconds" in error_msg2.lower():
-                        import re
-                        wait_match = re.search(r'wait of (\d+) seconds', error_msg2.lower())
-                        if wait_match:
-                            wait_seconds = int(wait_match.group(1))
-                            wait_minutes = wait_seconds // 60
-                            print("\n" + "="*80)
-                            print("⚠ RATE LIMITED - Telegram requires waiting")
-                            print("="*80)
-                            print(f"Telegram requires waiting {wait_minutes} minutes ({wait_seconds} seconds) before retry.")
-                            print(f"\nThe script will retry in 3 minutes (faster than required wait).")
-                            print("Please ensure TELEGRAM_CODE is updated with a fresh code.")
-                            print("="*80)
-                            # Return a special flag to indicate we need faster retry
-                            return "RATE_LIMITED"
-                        else:
-                            print("\n⚠ Rate limited by Telegram. Will retry in 3 minutes...")
-                            return "RATE_LIMITED"
-                    elif "3 consecutive" in error_msg2 or "rate limit" in error_msg2.lower() or "too many" in error_msg2.lower():
-                        print("\n" + "="*80)
-                        print("⚠ RATE LIMITED - Too many failed authentication attempts")
-                        print("="*80)
-                        print("Telegram has temporarily blocked authentication attempts.")
-                        print("\nTo fix this:")
-                        print("1. Wait 10-15 minutes for the rate limit to reset")
-                        print("2. Request a NEW code from Telegram (old codes expire quickly)")
-                        print("3. Update TELEGRAM_CODE in Coolify with the fresh code")
-                        print("4. The script will retry in 3 minutes (faster retry for authentication)")
-                        print("="*80)
-                        return "RATE_LIMITED"
-                    elif "code" in error_msg2.lower() or "invalid" in error_msg2.lower() or "PHONE_CODE" in error_msg2 or "Code already used" in error_msg2:
-                        print("\n⚠ Invalid or expired code.")
-                        print("   Telegram codes expire quickly (usually within 3-5 minutes).")
-                        print("   Please request a NEW code from Telegram and update TELEGRAM_CODE variable.")
-                        print("   Will retry in 3 minutes (faster retry for authentication)...")
-                        return "AUTH_FAILED"
-                    else:
-                        print("   Please check your credentials and try again.")
-                        print("   Will retry in 3 minutes (faster retry for authentication)...")
-                        return "AUTH_FAILED"
-            else:
-                # Not a corruption error, handle normally
-                try:
-                    await client.disconnect()
-                except:
-                    pass  # Ignore disconnect errors
-                
-                # Check for rate limiting (Telegram's "wait of X seconds" error)
-                if "wait of" in error_msg.lower() and "seconds" in error_msg.lower():
-                    import re
-                    wait_match = re.search(r'wait of (\d+) seconds', error_msg.lower())
-                    if wait_match:
-                        wait_seconds = int(wait_match.group(1))
-                        wait_minutes = wait_seconds // 60
-                        print("\n" + "="*80)
-                        print("⚠ RATE LIMITED - Telegram requires waiting")
-                        print("="*80)
-                        print(f"Telegram requires waiting {wait_minutes} minutes ({wait_seconds} seconds) before retry.")
-                        print(f"\nThe script will retry in 3 minutes (faster than required wait).")
-                        print("Please ensure TELEGRAM_CODE is updated with a fresh code.")
-                        print("="*80)
-                        return "RATE_LIMITED"
-                    else:
-                        print("\n⚠ Rate limited by Telegram. Will retry in 3 minutes...")
-                        return "RATE_LIMITED"
-                elif "3 consecutive" in error_msg or "rate limit" in error_msg.lower() or "too many" in error_msg.lower():
-                    print("\n" + "="*80)
-                    print("⚠ RATE LIMITED - Too many failed authentication attempts")
-                    print("="*80)
-                    print("Telegram has temporarily blocked authentication attempts.")
-                    print("\nTo fix this:")
-                    print("1. Wait 10-15 minutes for the rate limit to reset")
-                    print("2. Request a NEW code from Telegram (old codes expire quickly)")
-                    print("3. Update TELEGRAM_CODE in Coolify with the fresh code")
-                    print("4. The script will retry in 3 minutes (faster retry for authentication)")
-                    print("="*80)
-                    return "RATE_LIMITED"
-                elif "code" in error_msg.lower() or "invalid" in error_msg.lower() or "PHONE_CODE" in error_msg:
-                    print("\n⚠ Invalid or expired code.")
-                    print("   Telegram codes expire quickly (usually within 3-5 minutes).")
-                    print("   Please request a NEW code from Telegram and update TELEGRAM_CODE variable.")
-                    print("   Will retry in 3 minutes (faster retry for authentication)...")
-                    return "AUTH_FAILED"
-                else:
-                    print("   Please check your credentials and try again.")
-                    print("   Will retry in 3 minutes (faster retry for authentication)...")
-                    return "AUTH_FAILED"
+            authorized = await client.is_user_authorized()
+        except (AuthKeyUnregisteredError, SessionRevokedError, AuthKeyDuplicatedError) as e:
+            print(f"⚠ Telegram reports session revoked: {type(e).__name__}")
+            await _disconnect_quietly()
+            moved = backup_revoked_session_files(session_path)
+            if moved:
+                print(
+                    "✓ Backed up revoked session file(s): "
+                    + ", ".join(os.path.basename(f) for f in moved)
+                )
+            client = TelegramClient(session_path, api_id, api_hash)
+            await client.connect()
+            authorized = False
+    except Exception as e:
+        if is_sqlite_locked_error(e):
+            print("⚠ Session database is locked (another process may be using it).")
+            print("⚠ Skipping this run — session files left untouched.")
+            await _disconnect_quietly()
+            return None
+        if is_session_revoked_error(e):
+            print(f"⚠ Telegram reports session revoked: {type(e).__name__}")
+            await _disconnect_quietly()
+            moved = backup_revoked_session_files(session_path)
+            if moved:
+                print(
+                    "✓ Backed up revoked session file(s): "
+                    + ", ".join(os.path.basename(f) for f in moved)
+                )
+            client = TelegramClient(session_path, api_id, api_hash)
+            try:
+                await client.connect()
+            except Exception as e2:
+                if is_sqlite_locked_error(e2):
+                    print("⚠ Session database is locked after backup — skipping this run.")
+                    return None
+                raise
+            authorized = False
+        else:
+            raise
+
+    if authorized:
+        print("✓ Connected using existing session")
+    else:
+        print("⚠ Session not authorized.")
+        has_code = args.code or os.getenv("TELEGRAM_CODE")
+        if not has_code:
+            print("\n" + "=" * 80)
+            print("⚠ AUTHENTICATION REQUIRED – run auth_telegram_qr.py")
+            print("=" * 80)
+            print("Telegram session is missing or not logged in.")
+            print("Session files were NOT deleted.")
+            print("\nOn Coolify:")
+            print("  docker exec -it <telegram-scraper-container> python auth_telegram_qr.py")
+            print("  then restart the scraper service.")
+            print("\nOr set TELEGRAM_CODE (+ optional TELEGRAM_PASSWORD) and restart.")
+            print("=" * 80 + "\n")
+            print("⚠ Skipping this run. Will retry later...")
+            await _disconnect_quietly()
+            return None
+
+        result = await _env_code_login()
+        if result is not None:
+            return result
+        if not await client.is_user_authorized():
+            print("⚠ Still not authorized after login attempt — skipping this run.")
+            await _disconnect_quietly()
+            return None
 
     print(f"\n{'='*80}")
     print(f"TELEGRAM COURSE SCRAPER")
