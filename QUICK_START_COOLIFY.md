@@ -26,7 +26,7 @@ Do **not** commit `.env` (already gitignored). Set secrets in Coolify.
 ## 2. Create app in Coolify
 
 1. **New Resource** → **Application**
-2. Connect GitHub repo: `SHYAM-MAWAL/SHYAMAI_Udemy` (or your fork)
+2. Connect GitHub repo: `SHYAM-MAWAL/MY_TG_PROJECT`
 3. **Build Pack**: **Docker Compose**
 4. Compose file: `docker-compose.yaml`
 5. Branch: `main`
@@ -150,5 +150,5 @@ Then https://courses.shyamai.in/ loads courses from your Coolify Postgres API.
 | Postgres connection refused | Use internal host/port `5432`, not external `5433` |
 | Auth loop | Persist `/app/sessions`; remove stale `TELEGRAM_CODE` |
 | API 502 | Check `courses-api` logs; domain → port 8080 |
-| Site empty | Frontend still on old Supabase — set API URL & redeploy UI |
+| Site empty | Set frontend `NEXT_PUBLIC_COURSES_API_URL` to your API domain and redeploy UI |
 | Single scraper only | Don’t scale scraper horizontally (one Telegram session) |

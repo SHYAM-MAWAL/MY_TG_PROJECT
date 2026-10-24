@@ -29,13 +29,14 @@ Thumbs.db
 .env
 .env.local
 
-# Documentation
-*.md
-!README.md
-
 # Logs
 *.log
 
-# Git
+# Git / local junk
 .git/
-.gitignore
+frontend/node_modules/
+frontend/.next/
+.venv/
+telegram_qr.png
+seen_source_urls.txt
+last_message_id.txt
