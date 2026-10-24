@@ -37,8 +37,10 @@ services:
     container_name: courses-api
     restart: unless-stopped
     command: ["python", "courses_api.py"]
-    ports:
-      - "8080:8080"
+    # Do not bind host 8080 — Coolify reverse-proxy uses container port only.
+    # Host bind caused: "Bind for 0.0.0.0:8080 failed: port is already allocated"
+    expose:
+      - "8080"
     environment:
       - POSTGRES_HOST=${POSTGRES_HOST}
       - POSTGRES_PORT=${POSTGRES_PORT}
